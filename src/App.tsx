@@ -78,6 +78,7 @@ export default function App() {
   const conversationAbortRef = useRef<boolean>(false);
   const speechRecRef = useRef<any>(null);
 
+  const isDirectGoogleLiveRef = useRef<boolean>(false);
   const isMutedRef = useRef(isMuted);
   useEffect(() => {
     isMutedRef.current = isMuted;
@@ -372,12 +373,29 @@ export default function App() {
 
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
               const pcm16Base64 = float32To16BitPCMBase64(inputData);
-              wsRef.current.send(
-                JSON.stringify({
-                  type: "audio",
-                  data: pcm16Base64,
-                })
-              );
+              if (isDirectGoogleLiveRef.current) {
+                // Direct Google Multimodal Live API format
+                wsRef.current.send(
+                  JSON.stringify({
+                    realtimeInput: {
+                      mediaChunks: [
+                        {
+                          mimeType: "audio/pcm;rate=16000",
+                          data: pcm16Base64,
+                        },
+                      ],
+                    },
+                  })
+                );
+              } else {
+                // Local dev / relay server format
+                wsRef.current.send(
+                  JSON.stringify({
+                    type: "audio",
+                    data: pcm16Base64,
+                  })
+                );
+              }
             }
           };
 
@@ -387,11 +405,36 @@ export default function App() {
           console.warn("Microphone access not granted or unavailable, proceeding with audio output only:", micErr);
         }
 
-        // Establish WebSocket connection to /live
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${protocol}//${window.location.host}/live`;
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
+        // Check for Client-Side Gemini API Key for Direct Browser-to-Google Live WebSocket
+        const clientApiKey =
+          (import.meta as any).env?.VITE_GEMINI_API_KEY ||
+          (import.meta as any).env?.NEXT_PUBLIC_GEMINI_API_KEY ||
+          (typeof process !== "undefined"
+            ? process.env?.NEXT_PUBLIC_GEMINI_API_KEY || process.env?.VITE_GEMINI_API_KEY
+            : "");
+        const hasDirectGoogleKey = Boolean(
+          clientApiKey && clientApiKey !== "MY_GEMINI_API_KEY" && clientApiKey.length > 10
+        );
+
+        // Determine WebSocket endpoint: Direct Google Live API vs local dev server relay
+        let isDirectGoogleLive = false;
+        let wsUrl = "";
+        if (hasDirectGoogleKey) {
+          isDirectGoogleLive = true;
+          wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${clientApiKey}`;
+        } else {
+          const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+          wsUrl = `${protocol}//${window.location.host}/live`;
+        }
+        isDirectGoogleLiveRef.current = isDirectGoogleLive;
+
+        let ws: WebSocket | null = null;
+        try {
+          ws = new WebSocket(wsUrl);
+          wsRef.current = ws;
+        } catch (wsErr) {
+          console.warn("WebSocket init notice (HTTP voice engine ready):", wsErr);
+        }
 
         const callerName = activeCaller.name.trim() || "Client";
         const greetingText = activeCaller.plan
@@ -463,81 +506,147 @@ export default function App() {
           playGreetingOnce();
         }, 1500);
 
-        ws.onopen = () => {
-          // Send handshake with caller-personalized system instruction
-          ws.send(
-            JSON.stringify({
-              type: "init",
-              voice: selectedVoice || "Kore",
-              systemInstruction: buildCallerSystemPrompt(activeCaller),
-            })
-          );
-          playGreetingOnce();
-        };
-
-        ws.onmessage = async (event) => {
-          try {
-            const data = JSON.parse(event.data);
-
-            if (data.type === "ready") {
-              playGreetingOnce();
-            }
-
-            if (data.type === "audio" && (data.audio || data.data)) {
-              setIsIshaSpeaking(true);
-              const chunk = data.audio || data.data;
-              if (livePlayerRef.current.playChunkBase64) {
-                livePlayerRef.current.playChunkBase64(chunk);
-              } else {
-                livePlayerRef.current.playPCMChunk(chunk);
-              }
-            }
-
-            if ((data.type === "text" || data.type === "transcript") && data.text) {
-              setCurrentCaption(data.text);
-              setTranscripts((prev) => {
-                const last = prev[prev.length - 1];
-                if (last && last.role === "gemini") {
-                  return [
-                    ...prev.slice(0, -1),
-                    { ...last, text: last.text + " " + data.text },
-                  ];
-                }
-                return [
-                  ...prev,
-                  {
-                    id: `gemini-${Date.now()}`,
-                    role: "gemini",
-                    text: data.text,
-                    timestamp: new Date(),
+        if (ws) {
+          ws.onopen = () => {
+            if (isDirectGoogleLive) {
+              // Direct Google Live API Handshake Setup
+              ws?.send(
+                JSON.stringify({
+                  setup: {
+                    model: "models/gemini-2.0-flash-exp",
+                    generationConfig: {
+                      responseModalities: ["AUDIO"],
+                      speechConfig: {
+                        voiceConfig: {
+                          prebuiltVoiceConfig: { voiceName: selectedVoice || "Kore" },
+                        },
+                      },
+                    },
+                    systemInstruction: {
+                      parts: [{ text: buildCallerSystemPrompt(activeCaller) }],
+                    },
                   },
-                ];
-              });
+                })
+              );
+            } else {
+              // Local relay handshake
+              ws?.send(
+                JSON.stringify({
+                  type: "init",
+                  voice: selectedVoice || "Kore",
+                  systemInstruction: buildCallerSystemPrompt(activeCaller),
+                })
+              );
             }
+            playGreetingOnce();
+          };
 
-            if (data.type === "turnComplete") {
-              setIsIshaSpeaking(false);
+          ws.onmessage = async (event) => {
+            try {
+              const data = JSON.parse(event.data);
+
+              // 1. Direct Google Live API responses
+              if (data.serverContent?.modelTurn?.parts) {
+                for (const part of data.serverContent.modelTurn.parts) {
+                  if (part.inlineData?.data) {
+                    setIsIshaSpeaking(true);
+                    livePlayerRef.current.playPCMChunk(part.inlineData.data);
+                  }
+                  if (part.text) {
+                    setCurrentCaption(part.text);
+                    setTranscripts((prev) => {
+                      const last = prev[prev.length - 1];
+                      if (last && last.role === "gemini") {
+                        return [
+                          ...prev.slice(0, -1),
+                          { ...last, text: last.text + " " + data.text },
+                        ];
+                      }
+                      return [
+                        ...prev,
+                        {
+                          id: `gemini-${Date.now()}`,
+                          role: "gemini",
+                          text: part.text,
+                          timestamp: new Date(),
+                        },
+                      ];
+                    });
+                  }
+                }
+              }
+
+              if (data.serverContent?.turnComplete) {
+                setIsIshaSpeaking(false);
+              }
+
+              if (data.serverContent?.interrupted) {
+                livePlayerRef.current.stopAll();
+                setIsIshaSpeaking(false);
+              }
+
+              // 2. Relay format responses
+              if (data.type === "ready") {
+                playGreetingOnce();
+              }
+
+              if (data.type === "audio" && (data.audio || data.data)) {
+                setIsIshaSpeaking(true);
+                const chunk = data.audio || data.data;
+                if (livePlayerRef.current.playChunkBase64) {
+                  livePlayerRef.current.playChunkBase64(chunk);
+                } else {
+                  livePlayerRef.current.playPCMChunk(chunk);
+                }
+              }
+
+              if ((data.type === "text" || data.type === "transcript") && data.text) {
+                setCurrentCaption(data.text);
+                setTranscripts((prev) => {
+                  const last = prev[prev.length - 1];
+                  if (last && last.role === "gemini") {
+                    return [
+                      ...prev.slice(0, -1),
+                      { ...last, text: last.text + " " + data.text },
+                    ];
+                  }
+                  return [
+                    ...prev,
+                    {
+                      id: `gemini-${Date.now()}`,
+                      role: "gemini",
+                      text: data.text,
+                      timestamp: new Date(),
+                    },
+                  ];
+                });
+              }
+
+              if (data.type === "turnComplete") {
+                setIsIshaSpeaking(false);
+              }
+
+              if (data.type === "interrupted") {
+                livePlayerRef.current.stopAll();
+                setIsIshaSpeaking(false);
+              }
+            } catch (parseErr) {
+              console.error("Failed to parse WebSocket message:", parseErr);
             }
+          };
 
-            if (data.type === "interrupted") {
-              livePlayerRef.current.stopAll();
-              setIsIshaSpeaking(false);
-            }
-          } catch (parseErr) {
-            console.error("Failed to parse WebSocket message:", parseErr);
-          }
-        };
+          ws.onerror = (err) => {
+            console.warn("WebSocket live notice (Serverless HTTP Voice mode active on Vercel):", err);
+            playGreetingOnce();
+          };
 
-        ws.onerror = (err) => {
-          console.warn("WebSocket live notice (Serverless HTTP Voice mode active on Vercel):", err);
+          ws.onclose = () => {
+            console.log("WebSocket closed; remaining in active HD IVR call.");
+            wsRef.current = null;
+          };
+        } else {
           playGreetingOnce();
-        };
-
-        ws.onclose = () => {
-          // On Vercel, WebSocket serverless closes immediately. Do NOT disconnect call!
-          console.log("WebSocket closed; remaining in active HD IVR call.");
-          wsRef.current = null;
-        };
+        }
       } catch (err: any) {
         console.error("Failed to start session:", err);
         setIsConnecting(false);
