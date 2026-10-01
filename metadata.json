@@ -1,0 +1,10 @@
+{
+  "name": "Remix Criminal Defence Legal Assistant",
+  "description": "Virtual assistant for criminal defence intake, handling urgent inquiries, custody checks, FIR notices, and lawyer consultations with warm empathy.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
