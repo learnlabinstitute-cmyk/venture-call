@@ -86,6 +86,7 @@ export class LiveAudioPlayer {
   private audioCtx: AudioContext | null = null;
   private nextStartTime: number = 0;
   private activeSourceNodes: AudioBufferSourceNode[] = [];
+  private activeAudioElements: HTMLAudioElement[] = [];
   private analyserNode: AnalyserNode | null = null;
   private gainNode: GainNode | null = null;
   private isMuted: boolean = false;
@@ -111,8 +112,8 @@ export class LiveAudioPlayer {
       this.analyserNode.connect(this.audioCtx.destination);
     }
 
-    if (this.audioCtx.state === "suspended") {
-      this.audioCtx.resume();
+    if (this.audioCtx && this.audioCtx.state === "suspended") {
+      this.audioCtx.resume().catch(() => {});
     }
   }
 
@@ -121,6 +122,9 @@ export class LiveAudioPlayer {
     if (this.gainNode) {
       this.gainNode.gain.value = this.isMuted ? 0 : this.volume;
     }
+    this.activeAudioElements.forEach((a) => {
+      a.volume = this.isMuted ? 0 : this.volume;
+    });
   }
 
   public setMuted(muted: boolean) {
@@ -128,6 +132,9 @@ export class LiveAudioPlayer {
     if (this.gainNode) {
       this.gainNode.gain.value = muted ? 0 : this.volume;
     }
+    this.activeAudioElements.forEach((a) => {
+      a.volume = muted ? 0 : this.volume;
+    });
   }
 
   public playPCMChunk(base64Data: string) {
@@ -173,12 +180,15 @@ export class LiveAudioPlayer {
     this.playPCMChunk(base64Data);
   }
 
-  // Play full base64 audio response (decodes standard audio container or raw 24kHz PCM)
+  // Play full base64 audio response (decodes standard audio container WAV/MP3 or raw 24kHz PCM)
   public async playBase64Audio(base64Data: string): Promise<void> {
     this.init();
-    if (!this.audioCtx || !this.gainNode) return;
 
     try {
+      if (this.audioCtx && this.audioCtx.state === "suspended") {
+        await this.audioCtx.resume().catch(() => {});
+      }
+
       const cleanBase64 = base64Data.replace(/[\r\n\t ]/g, "");
       const binaryString = atob(cleanBase64);
       const len = binaryString.length;
@@ -187,25 +197,52 @@ export class LiveAudioPlayer {
         bytes[i] = binaryString.charCodeAt(i);
       }
 
-      // Try decoding as container (WAV, MP3, etc.)
-      try {
-        const audioBuffer = await this.audioCtx.decodeAudioData(bytes.buffer.slice(0));
-        await this.playAudioBuffer(audioBuffer);
-        return;
-      } catch {
-        // Fall back to raw 24kHz PCM AudioBuffer
-        const float32Samples = base64ToFloat32PCM(cleanBase64);
-        if (float32Samples.length > 0) {
-          const audioBuffer = this.audioCtx.createBuffer(1, float32Samples.length, 24000);
-          audioBuffer.getChannelData(0).set(float32Samples);
+      // Try decoding as container (WAV, MP3, etc.) through Web Audio graph
+      if (this.audioCtx && this.gainNode) {
+        try {
+          const audioBuffer = await this.audioCtx.decodeAudioData(bytes.buffer.slice(0));
           await this.playAudioBuffer(audioBuffer);
           return;
+        } catch (decodeErr) {
+          console.warn("Web Audio decode failed, falling back to HTMLAudioElement:", decodeErr);
         }
       }
+
+      // Fallback: Direct HTMLAudioElement playback (universally supported on iOS & mobile)
+      await this.playViaAudioElement(bytes, "audio/wav");
     } catch (e) {
       console.error("Error in playBase64Audio:", e);
       this.playPCMChunk(base64Data);
     }
+  }
+
+  private playViaAudioElement(bytes: Uint8Array, mimeType: string = "audio/wav"): Promise<void> {
+    return new Promise((resolve) => {
+      try {
+        const blob = new Blob([bytes], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        audio.volume = this.isMuted ? 0 : this.volume;
+        this.activeAudioElements.push(audio);
+
+        const cleanup = () => {
+          URL.revokeObjectURL(url);
+          const idx = this.activeAudioElements.indexOf(audio);
+          if (idx > -1) this.activeAudioElements.splice(idx, 1);
+          resolve();
+        };
+
+        audio.onended = cleanup;
+        audio.onerror = cleanup;
+
+        audio.play().catch((playErr) => {
+          console.warn("HTML Audio element play notice:", playErr);
+          cleanup();
+        });
+      } catch {
+        resolve();
+      }
+    });
   }
 
   private playAudioBuffer(audioBuffer: AudioBuffer): Promise<void> {
@@ -250,6 +287,7 @@ export class LiveAudioPlayer {
   }
 
   public isPlaying(): boolean {
+    if (this.activeAudioElements.length > 0) return true;
     if (!this.audioCtx) return false;
     return this.audioCtx.currentTime < this.nextStartTime;
   }
@@ -262,6 +300,15 @@ export class LiveAudioPlayer {
       } catch (e) {}
     });
     this.activeSourceNodes = [];
+
+    this.activeAudioElements.forEach((audio) => {
+      try {
+        audio.pause();
+        audio.currentTime = 0;
+      } catch (e) {}
+    });
+    this.activeAudioElements = [];
+
     if (this.audioCtx) {
       this.nextStartTime = this.audioCtx.currentTime;
     }

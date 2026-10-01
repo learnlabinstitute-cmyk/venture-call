@@ -43,32 +43,48 @@ async function startServer() {
   // Turn-based Voice / TTS Generation endpoint (supports both /api/tts and /api/speak)
   const handleTTS = async (req: express.Request, res: express.Response) => {
     try {
-      const { text, voice = "Kore", systemInstruction } = req.body;
+      const { text, voice = "Kore" } = req.body;
       if (!text) {
         return res.status(400).json({ error: "Text is required" });
       }
 
+      const cleanText = text
+        .replace(/[*_#`[\]()]/g, " ")
+        .replace(/https?:\/\/\S+/gi, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
       const ai = getGenAI();
       if (ai) {
         try {
-          const prompt = `Say warmly and clearly as customer care executive Isha: ${text}`;
           const response = await ai.models.generateContent({
             model: "gemini-3.8-flash-lite-tts",
-            contents: [{ parts: [{ text: prompt }] }],
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: cleanText,
+                    speechMetadata: {
+                      style: "Warm, reassuring, articulate Indian customer care executive Isha",
+                    },
+                  },
+                ],
+              } as any,
+            ],
             config: {
-              responseModalities: [Modality.AUDIO],
+              responseModalities: ["AUDIO"],
               speechConfig: {
                 voiceConfig: {
                   prebuiltVoiceConfig: { voiceName: voice || "Kore" },
                 },
               },
-              systemInstruction: systemInstruction || "You are Isha, senior customer care executive at Venture Infotech Support 24. Speak warmly in polite, calm Hindi/Hinglish.",
             },
           });
 
           const audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
           if (audioBase64) {
-            return res.json({ audio: audioBase64, data: audioBase64 });
+            return res.json({ audio: audioBase64, data: audioBase64, mimeType: "audio/wav", success: true });
           }
         } catch (geminiTtsErr) {
           console.warn("Gemini TTS in server failed, falling back to natural neural audio:", geminiTtsErr);
@@ -76,8 +92,16 @@ async function startServer() {
       }
 
       // Natural Neural Voice Audio Generation (Never robotic)
-      const neuralAudio = await fetchNeuralTTSAudio(text, "hi");
-      res.json({ audio: neuralAudio, data: neuralAudio });
+      try {
+        const neuralAudio = await fetchNeuralTTSAudio(cleanText, "hi");
+        if (neuralAudio) {
+          return res.json({ audio: neuralAudio, data: neuralAudio, mimeType: "audio/mp3", success: true });
+        }
+      } catch (neuralErr) {
+        console.warn("Neural audio generation error:", neuralErr);
+      }
+
+      res.json({ audio: null, data: null, text: cleanText, fallbackToBrowser: true, success: true });
     } catch (err: any) {
       console.error("Error generating speech:", err);
       res.status(500).json({ error: err.message || "Failed to generate speech" });
@@ -165,11 +189,29 @@ MANDATORY RULES & EXECUTIVE SCRIPTS:
           }
 
           if (responseText) {
+            const cleanSpeech = responseText
+              .replace(/[*_#`[\]()]/g, " ")
+              .replace(/https?:\/\/\S+/gi, "")
+              .replace(/\s+/g, " ")
+              .trim();
+
             const ttsResponse = await ai.models.generateContent({
               model: "gemini-3.8-flash-lite-tts",
-              contents: [{ parts: [{ text: `Say warmly and clearly as customer care executive Isha: ${responseText}` }] }],
+              contents: [
+                {
+                  role: "user",
+                  parts: [
+                    {
+                      text: cleanSpeech,
+                      speechMetadata: {
+                        style: "Warm, reassuring, articulate Indian customer care executive Isha",
+                      },
+                    },
+                  ],
+                } as any,
+              ],
               config: {
-                responseModalities: [Modality.AUDIO],
+                responseModalities: ["AUDIO"],
                 speechConfig: {
                   voiceConfig: {
                     prebuiltVoiceConfig: { voiceName: voice || "Kore" },

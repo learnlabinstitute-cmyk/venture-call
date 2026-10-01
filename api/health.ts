@@ -9,8 +9,12 @@ export default async function handler(req: any, res: any) {
 
   res.status(200).json({
     status: "ok",
-    hasApiKey: Boolean(process.env.GEMINI_API_KEY),
-    model: "gemini-3.1-flash-tts-preview",
+    hasApiKey: Boolean(
+      (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY") ||
+      (process.env.VITE_GEMINI_API_KEY && process.env.VITE_GEMINI_API_KEY !== "MY_GEMINI_API_KEY")
+    ),
+    model: "gemini-3.8-flash-lite-tts",
+    chatModel: "gemini-3.8-flash",
     platform: "vercel",
   });
 }

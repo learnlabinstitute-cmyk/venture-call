@@ -125,7 +125,6 @@ export default function App() {
           body: JSON.stringify({
             text,
             voice: voiceOverride || (isUserVoice ? "Puck" : selectedVoice || "Kore"),
-            systemInstruction: buildCallerSystemPrompt(callerInfo),
           }),
         });
 
@@ -136,7 +135,6 @@ export default function App() {
             body: JSON.stringify({
               text,
               voice: voiceOverride || (isUserVoice ? "Puck" : selectedVoice || "Kore"),
-              systemInstruction: buildCallerSystemPrompt(callerInfo),
             }),
           });
         }
@@ -293,7 +291,9 @@ export default function App() {
         setCurrentCaption(replyText);
 
         if (audioBase64) {
+          setIsIshaSpeaking(true);
           await livePlayerRef.current.playBase64Audio(audioBase64);
+          setIsIshaSpeaking(false);
         } else {
           await speakText(replyText);
         }
@@ -407,7 +407,6 @@ export default function App() {
               body: JSON.stringify({
                 text: greetingText,
                 voice: selectedVoice || "Kore",
-                systemInstruction: buildCallerSystemPrompt(activeCaller),
               }),
             });
             if (!res.ok) {
@@ -417,7 +416,6 @@ export default function App() {
                 body: JSON.stringify({
                   text: greetingText,
                   voice: selectedVoice || "Kore",
-                  systemInstruction: buildCallerSystemPrompt(activeCaller),
                 }),
               });
             }
@@ -531,14 +529,14 @@ export default function App() {
         };
 
         ws.onerror = (err) => {
-          console.warn("WebSocket live notice (falling back smoothly to HTTP/TTS):", err);
+          console.warn("WebSocket live notice (Serverless HTTP Voice mode active on Vercel):", err);
           playGreetingOnce();
         };
 
         ws.onclose = () => {
-          if (connectionState === "connected") {
-            setConnectionState("disconnected");
-          }
+          // On Vercel, WebSocket serverless closes immediately. Do NOT disconnect call!
+          console.log("WebSocket closed; remaining in active HD IVR call.");
+          wsRef.current = null;
         };
       } catch (err: any) {
         console.error("Failed to start session:", err);
@@ -558,25 +556,44 @@ export default function App() {
     if (!SpeechRecognition) return;
 
     let isDisposed = false;
+    let accumulatedText = "";
+    let silenceTimeout: any = null;
 
     if (connectionState === "connected" && !isMuted) {
       try {
         const recognition = new SpeechRecognition();
         recognition.continuous = true;
-        recognition.interimResults = false;
+        recognition.interimResults = true;
         recognition.lang = "hi-IN";
 
         recognition.onresult = (event: any) => {
           if (isIshaSpeakingRef.current) return;
-          const results = event.results;
-          if (results && results.length > 0) {
-            const last = results[results.length - 1];
-            if (last && last[0] && last[0].transcript) {
-              const text = last[0].transcript.trim();
-              if (text.length > 1) {
-                handleSendMessage(text);
-              }
+          
+          let interim = "";
+          let final = "";
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+              final += transcript;
+            } else {
+              interim += transcript;
             }
+          }
+
+          const phrase = (final || interim).trim();
+          if (phrase) {
+            accumulatedText = phrase;
+            setIsUserSpeaking(true);
+
+            if (silenceTimeout) clearTimeout(silenceTimeout);
+            silenceTimeout = setTimeout(() => {
+              if (accumulatedText.trim() && !isIshaSpeakingRef.current) {
+                const textToSend = accumulatedText.trim();
+                accumulatedText = "";
+                setIsUserSpeaking(false);
+                handleSendMessage(textToSend);
+              }
+            }, 1100);
           }
         };
 
@@ -603,6 +620,7 @@ export default function App() {
         console.warn("Could not start speech recognition:", err);
       }
     } else {
+      if (silenceTimeout) clearTimeout(silenceTimeout);
       if (speechRecRef.current) {
         try {
           speechRecRef.current.stop();
@@ -613,6 +631,7 @@ export default function App() {
 
     return () => {
       isDisposed = true;
+      if (silenceTimeout) clearTimeout(silenceTimeout);
       if (speechRecRef.current) {
         try {
           speechRecRef.current.stop();

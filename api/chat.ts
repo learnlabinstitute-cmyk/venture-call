@@ -2,7 +2,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { fetchNeuralTTSAudio, matchExecutiveResponse } from "../src/utils/executiveEngine";
 
 function getGenAI(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
   if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
     return null;
   }
@@ -113,21 +113,31 @@ export default async function handler(req: any, res: any) {
           responseText = promptResponse.text;
         }
 
-        // Try Gemini TTS
+        // Try Gemini 3.8 Flash Lite TTS
         if (responseText) {
+          const cleanSpeechText = responseText
+            .replace(/[*_#`[\]()]/g, " ")
+            .replace(/https?:\/\/\S+/gi, "")
+            .replace(/\s+/g, " ")
+            .trim();
+
           const ttsResponse = await ai.models.generateContent({
             model: "gemini-3.8-flash-lite-tts",
             contents: [
               {
+                role: "user",
                 parts: [
                   {
-                    text: `Say warmly and clearly as customer care executive Isha: ${responseText}`,
+                    text: cleanSpeechText,
+                    speechMetadata: {
+                      style: "Warm, reassuring, articulate Indian customer care executive Isha",
+                    },
                   },
                 ],
-              },
+              } as any,
             ],
             config: {
-              responseModalities: [Modality.AUDIO],
+              responseModalities: ["AUDIO"],
               speechConfig: {
                 voiceConfig: {
                   prebuiltVoiceConfig: { voiceName: voice || "Kore" },
@@ -138,8 +148,8 @@ export default async function handler(req: any, res: any) {
           ttsAudio =
             ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || null;
         }
-      } catch (geminiErr) {
-        console.warn("Gemini chat/TTS warning, falling back to executive engine:", geminiErr);
+      } catch (geminiErr: any) {
+        console.warn("Gemini chat/TTS warning in Vercel function:", geminiErr?.message || geminiErr);
       }
     }
 
@@ -151,9 +161,14 @@ export default async function handler(req: any, res: any) {
     // If TTS audio is still needed, generate natural neural audio
     if (!ttsAudio) {
       try {
-        ttsAudio = await fetchNeuralTTSAudio(responseText, "hi");
-      } catch (neuralErr) {
-        console.warn("Neural audio generation warning:", neuralErr);
+        const cleanFallbackText = responseText
+          .replace(/[*_#`[\]()]/g, " ")
+          .replace(/https?:\/\/\S+/gi, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        ttsAudio = await fetchNeuralTTSAudio(cleanFallbackText, "hi");
+      } catch (neuralErr: any) {
+        console.warn("Neural audio generation warning:", neuralErr?.message || neuralErr);
       }
     }
 
@@ -161,6 +176,8 @@ export default async function handler(req: any, res: any) {
       text: responseText,
       reply: responseText,
       audio: ttsAudio,
+      mimeType: ttsAudio ? "audio/wav" : undefined,
+      success: true,
     });
   } catch (err: any) {
     console.error("Vercel chat error:", err);
